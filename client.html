@@ -1,0 +1,254 @@
+<body>
+  <canvas style="position:absolute;left:0;top:0;"></canvas>
+</body>
+<script>
+
+(function() {
+  const canvas = document.querySelector('canvas');
+  const context = canvas.getContext('2d');
+  let handleImageURL = null;
+
+  function reconnect() {
+    const socket = new WebSocket('ws://' + location.host);
+    socket.onmessage = e => {
+      if (handleImageURL) handleImageURL(e.data);
+    };
+    socket.onerror = socket.onclose = () => {
+      try { socket.close(); } catch (e) {}
+      setTimeout(reconnect, 250);
+    };
+  }
+
+  function decodeImage(url) {
+    return new Promise((resolve, reject) => {
+      const image = new Image;
+      image.onload = () => {
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        const w = canvas.width = image.width;
+        const h = canvas.height = image.height;
+        context.drawImage(image, 0, 0);
+        resolve(context.getImageData(0, 0, w, h));
+      };
+      image.src = url;
+    });
+  }
+
+  function thresholdImageData(imageData) {
+    const from = imageData.data;
+    const to = new Uint8Array(from.length >> 2);
+    for (let i = 0; i < from.length; i += 4) {
+      to[i >> 2] = from[i] > 223 && from[i + 1] > 223 && from[i + 2] > 223;
+    }
+    return {width: imageData.width, height: imageData.height, data: to};
+  }
+
+  function ignoreImages(count) {
+    return new Promise((resolve, reject) => {
+      let i = 0;
+      handleImageURL = () => {
+        if (++i <= count) return;
+        handleImageURL = null;
+        resolve();
+      };
+    });
+  }
+
+  function waitForImage() {
+    return new Promise((resolve, reject) => {
+      let i = 0;
+      handleImageURL = url => {
+        if (++i <= 2) return;
+        handleImageURL = null;
+        decodeImage(url).then(resolve);
+      };
+    });
+  }
+
+  async function waitForWhiteImage() {
+    context.fillStyle = '#FFF';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+
+    return waitForImage();
+  }
+
+  async function waitForBarsImage(axis, start, stride, thickness) {
+    const limit = {x: canvas.width, y: canvas.height}[axis];
+    start *= limit;
+    stride *= limit;
+    thickness *= limit;
+
+    // Background
+    context.fillStyle = '#000';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Bars
+    context.fillStyle = '#FFF';
+    for (var i = start; i < limit; i += stride) {
+      switch (axis) {
+        case 'x': context.fillRect(i, 0, thickness, canvas.height); break;
+        case 'y': context.fillRect(0, i, canvas.width, thickness); break;
+      }
+    }
+
+    return waitForImage().then(thresholdImageData);
+  }
+
+  async function measureMappingAlongAxis(coarseDivisions, fineDivisions, axis, pixelCount) {
+    const coarseImages = [];
+    const coarseImagesShifted = [];
+    const mapping = {};
+
+    // Use a binary encoding to quickly locate large bars of the image
+    for (let c = 0; c < coarseDivisions; c++) {
+      const count = 1 << c;
+      coarseImages.push(await waitForBarsImage(axis, 0.5 / count, 1 / count, 0.5 / count));
+      coarseImagesShifted.push(await waitForBarsImage(axis, 0.5 / count - 0.5 / (1 << coarseDivisions), 1 / count, 0.5 / count));
+    }
+
+    // Scan a line within each bar to get more precision
+    for (let f = 0; f < fineDivisions; f++) {
+      const count = 1 << coarseDivisions;
+      const image = await waitForBarsImage(axis, (f + 0.5) / (count * fineDivisions) - 1 / pixelCount, 1 / count, 2 / pixelCount);
+      const center = f + 0.5;
+
+      // Track this bar with the pixels it overlaps
+      for (let y = 0, pixel = 0; y < image.height; y++) {
+        for (let x = 0; x < image.width; x++, pixel++) {
+          if (!image.data[pixel]) continue;
+          let offset = 0;
+
+          // Use the unshifted measurements if we're near the center of the bar
+          if (center > fineDivisions * 0.25 && center < fineDivisions * 0.75) {
+            for (let c = 0; c < coarseDivisions; c++) {
+              if (coarseImages[c].data[pixel]) {
+                offset |= 1 << (coarseDivisions - c - 1);
+              }
+            }
+          }
+
+          // Use the shifted measurements if we're near the edge of the bar
+          else {
+            for (let c = 0; c < coarseDivisions; c++) {
+              if (coarseImagesShifted[c].data[pixel]) {
+                offset |= 1 << (coarseDivisions - c - 1);
+              }
+            }
+            if (f > fineDivisions * 0.5) {
+              offset--;
+              if (offset < 0) offset += 1 << coarseDivisions;
+            }
+          }
+
+          (mapping[pixel] || (mapping[pixel] = [])).push(f + offset * fineDivisions);
+        }
+      }
+    }
+
+    return mapping;
+  }
+
+  function mergeMappings(mappingX, mappingY, width, height, pointCount) {
+    const points = {};
+
+    for (let y = 0, pixel = 0; y < height; y++) {
+      for (let x = 0; x < width; x++, pixel++) {
+        const linesX = mappingX[pixel];
+        const linesY = mappingY[pixel];
+        if (!linesX || !linesY) continue;
+
+        // Record every time two lines overlap
+        for (const lineX of linesX) {
+          for (const lineY of linesY) {
+            const index = lineX + lineY * pointCount;
+            const point = points[index] || (points[index] = {x: 0, y: 0, n: 0});
+            point.x += x;
+            point.y += y;
+            point.n++;
+          }
+        }
+      }
+    }
+
+    // Compute the centroid of each overlap
+    for (const index in points) {
+      const point = points[index];
+      point.x /= point.n;
+      point.y /= point.n;
+    }
+
+    return points;
+  }
+
+  function renderGrid(imageData, points, pointCount) {
+    const scale = 3;
+    const small = document.createElement('canvas');
+    small.width = imageData.width;
+    small.height = imageData.height;
+    small.getContext('2d').putImageData(imageData, 0, 0);
+
+    canvas.style.position = 'static';
+    canvas.width = imageData.width * scale;
+    canvas.height = imageData.height * scale;
+
+    // Background
+    context.drawImage(small, 0, 0, canvas.width, canvas.height);
+
+    // Edges
+    context.strokeStyle = '#00F';
+    context.beginPath();
+    for (let y = 0, i = 1; y < pointCount; y++, i++) {
+      for (let x = 1; x < pointCount; x++, i++) {
+        const a = points[i - 1];
+        const b = points[i];
+        if (!a || !b) continue;
+        context.moveTo(a.x * scale, a.y * scale);
+        context.lineTo(b.x * scale, b.y * scale);
+      }
+    }
+    for (let y = 1, i = pointCount; y < pointCount; y++) {
+      for (let x = 0; x < pointCount; x++, i++) {
+        const a = points[i - pointCount];
+        const b = points[i];
+        if (!a || !b) continue;
+        context.moveTo(a.x * scale, a.y * scale);
+        context.lineTo(b.x * scale, b.y * scale);
+      }
+    }
+    context.stroke();
+
+    // Vertices
+    context.fillStyle = '#0F0';
+    for (let y = 0, i = 0; y < pointCount; y++) {
+      for (let x = 0; x < pointCount; x++, i++) {
+        const point = points[i];
+        if (!point) continue;
+        context.beginPath();
+        context.arc(point.x * scale, point.y * scale, 1, 0, 2 * Math.PI, false);
+        context.fill();
+      }
+    }
+  }
+
+  async function main() {
+    canvas.width = innerWidth;
+    canvas.height = innerHeight;
+    reconnect();
+
+    const coarseDivisions = 3;
+    const fineDivisions = 8;
+    const pointCount = (1 << coarseDivisions) * fineDivisions;
+
+    await ignoreImages(2);
+    const whiteImage = await waitForWhiteImage();
+    const mappingX = await measureMappingAlongAxis(coarseDivisions, fineDivisions, 'x', canvas.width);
+    const mappingY = await measureMappingAlongAxis(coarseDivisions, fineDivisions, 'y', canvas.height);
+    const points = mergeMappings(mappingX, mappingY, whiteImage.width, whiteImage.height, pointCount);
+
+    renderGrid(whiteImage, points, pointCount);
+  }
+
+  main();
+})();
+
+</script>

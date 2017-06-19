@@ -1,0 +1,92 @@
+<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1">
+<style>
+  body {
+    font-family: sans-serif;
+  }
+</style>
+<h1>Video Capture</h1>
+<p>
+  This is a small app that repeatedly captures images from your phone and sends them via HTTP post.
+  I use it to send pictures to a local server on my LAN.
+  It needs to be up on GitHub because it needs to use HTTPS.
+  Browsers sadly decided to deliberately break the video element over HTTP, so this is my workaround.
+  To use this, open Firefox on Android and set <code>security.mixed_content.block_active_content</code> to <code>false</code>.
+</p>
+<p>
+  Address: <input type="text" placeholder="http://192.168.0.10:8000" autofocus autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+  <button>Connect</button>
+</p>
+<video style="display:none;" autoplay></video>
+<script>
+
+onerror = function() {
+  alert(Array.prototype.slice.call(arguments).join(' '));
+};
+
+(function() {
+  var video = document.querySelector('video');
+  var input = document.querySelector('input');
+  var button = document.querySelector('button');
+  var canvas = document.createElement('canvas');
+  var context = canvas.getContext('2d');
+  var isFirstFail = true;
+
+  var url = localStorage.getItem('url');
+  if (url !== null) input.value = url;
+
+  input.oninput = function() {
+    localStorage.setItem('url', input.value);
+  };
+
+  function fail(text) {
+    if (isFirstFail) {
+      isFirstFail = false;
+      alert(text);
+      location.reload();
+    }
+  }
+
+  button.onclick = function() {
+    var url = input.value;
+    var xhr = null;
+
+    input.disabled = true;
+    button.disabled = true;
+
+    function tick() {
+      var w = video.videoWidth;
+      var h = video.videoHeight;
+
+      if (xhr === null && w && h) {
+        if (canvas.width !== w) canvas.width = w;
+        if (canvas.height !== h) canvas.height = h;
+        context.save();
+        context.translate(0, h / 2);
+        context.scale(1, -1);
+        context.translate(0, -h / 2);
+        context.drawImage(video, 0, 0, w, h);
+        context.restore();
+        var data = canvas.toDataURL('image/jpeg');
+
+        xhr = new XMLHttpRequest;
+        xhr.open('POST', url);
+        xhr.onloadend = function() {
+          xhr = null;
+        };
+        xhr.send(data);
+      }
+
+      requestAnimationFrame(tick);
+    }
+
+    var getUserMedia = navigator.getUserMedia || navigator.mozGetUserMedia;
+    getUserMedia.call(navigator, {video: true}, function(stream) {
+      video.src = URL.createObjectURL(stream);
+      tick();
+    }, function() {
+      fail('Calling getUserMedia failed');
+    });
+  };
+})();
+
+</script>
